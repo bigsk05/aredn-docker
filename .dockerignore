@@ -1,0 +1,11 @@
+# Rootfs build artifacts — gitignored in the repo AND excluded from the docker
+# context. The Dockerfile's `ADD ${ROOTFS_TAR} /` can therefore only reference a
+# tarball the builder explicitly produced. CI writes out/<arch>.tar.gz and passes
+# ROOTFS_TAR=out/<arch>.tar.gz (build.yml); the README shows the same local flow.
+# A bare `docker build .` (default ROOTFS_TAR=rootfs-x86_64.tar.gz) fails loudly
+# at ADD instead of silently baking a stale or wrong-arch rootfs.
+rootfs-*.tar.gz
+rootfs-*.img
+*.sha256
+logs/
+tmp/

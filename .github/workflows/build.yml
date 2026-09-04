@@ -1,0 +1,342 @@
+# AREDN supernode/tunnelserver container images — automatic build & publish
+#
+# Three independent pipelines, one per architecture (x86_64 / arm64 / armv7l):
+#   * x86_64    rootfs from official downloads.arednmesh.org (release builds)
+#   * arm64     rootfs from the matching release asset on fork bigsk05/aredn
+#   * armv7l    same
+# A daily cron probes the latest official release; whoever is ready builds,
+# whoever isn't skips (the next cron checks again) — no pipeline waits for
+# another. This is exactly the "arm is stale but x86 updated → only x86 builds"
+# mechanism.
+#
+# Releases only (4.x.y.z) — nightlies are not tracked.
+
+name: build
+
+on:
+  schedule:
+    # Daily 02:23 UTC (10:23 +08). Off the top-of-the-hour peak.
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Which architecture to build (all = the three pipelines)'
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - x86_64
+          - arm64
+          - armv7l
+      force:
+        description: 'true = ignore the "already published" check and rebuild'
+        required: false
+        default: 'false'
+        # choice (not boolean): a dropdown always lands one of two explicit strings,
+        # so a "checked but ignored" dispatch is impossible to misread (boolean
+        # checkbox propagation has bitten this repo: a fresh dispatch with force
+        # checked still reached the gate as false).
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  # Scoped per branch/event so a daily cron and a manual dispatch don't queue up
+  # and cancel each other
+  group: aredn-docker-build-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------------
+  # 0. Detect the latest official release version (shared by all pipelines)
+  # ------------------------------------------------------------------
+  discover:
+    name: Discover official version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.latest.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect latest official release
+        id: latest
+        run: |
+          set -eu
+          V="$(scripts/latest-official-version.sh)"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "::notice::latest official AREDN release = $V"
+
+  # ------------------------------------------------------------------
+  # 1. The three pipelines (matrix expands to 3 parallel jobs)
+  # ------------------------------------------------------------------
+  docker:
+    name: ${{ matrix.arch }}
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            platform: linux/amd64
+            want_elf: x86-64
+          - arch: arm64
+            platform: linux/arm64
+            want_elf: aarch64
+          - arch: armv7l
+            platform: linux/arm/v7
+            want_elf: 'ARM'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Login early: the gate's `imagetools inspect` "already built" check needs
+      # auth too. After the first push the GHCR package is private; an anonymous
+      # inspect of an existing tag returns 401 → forever treated as "not built" →
+      # rebuilt every cron. login is idempotent and doesn't affect later steps.
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---- Gate: source ready && not already built && arch filter ----
+      - name: Gate (source ready && not already built && arch filter)
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          VERSION="${{ needs.discover.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          IMAGE="${{ env.IMAGE }}"
+
+          # Diagnose input propagation: print the RAW dispatch inputs so a "why
+          # did it skip" is self-evident instead of a silent gate skip. Schedule
+          # runs have empty inputs (''); a manual dispatch must show force=true
+          # here for the rebuild to happen.
+          echo "  gate inputs: event=${{ github.event_name }} arch=${{ inputs.arch }} force=${{ inputs.force }}"
+          echo "::notice::gate inputs: event=${{ github.event_name }} arch=${{ inputs.arch }} force=${{ inputs.force }}"
+
+          ARCH_FILTER="${{ github.event_name == 'workflow_dispatch' && inputs.arch != 'all' && matrix.arch != inputs.arch }}"
+          FORCE="${{ inputs.force == 'true' }}"
+          echo "  gate eval: ARCH_FILTER=$ARCH_FILTER FORCE=$FORCE"
+
+          # 1) Manual dispatch pinned an arch — skip the unrelated ones
+          if [ "$ARCH_FILTER" = "true" ]; then
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            echo "why=manual dispatch: only ${inputs.arch}"
+            exit 0
+          fi
+
+          # 2) Is this architecture's rootfs source ready?
+          ./scripts/check-arch-source.sh "$VERSION" "$ARCH" "$GH_TOKEN" > /tmp/src.txt
+          READY="$(sed -n 's/^ready=//p' /tmp/src.txt)"
+          URL="$(sed -n 's/^url=//p' /tmp/src.txt)"
+          REASON="$(sed -n 's/^reason=//p' /tmp/src.txt)"
+          if [ "$READY" != "yes" ] || [ -z "$URL" ]; then
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            echo "why=$REASON"
+            exit 0
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+          # 3) Already published → don't rebuild (the force input overrides)
+          if [ "$FORCE" != "true" ] &&
+             docker buildx imagetools inspect "${IMAGE}:${VERSION}-${ARCH}" >/dev/null 2>&1; then
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            echo "why=${VERSION}-${ARCH} already built (force='${{ inputs.force }}')"
+            exit 0
+          fi
+
+          echo "run=yes" >> "$GITHUB_OUTPUT"
+          echo "why=new build ${VERSION}-${ARCH}"
+
+      - name: Ensure debugfs (e2fsprogs)
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          if ! command -v debugfs >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq e2fsprogs
+          fi
+
+      # ---- buildx / qemu ----
+      - name: Set up buildx
+        if: steps.gate.outputs.run == 'yes'
+        uses: docker/setup-buildx-action@v3
+
+      # The RUN-less Dockerfile shouldn't need QEMU; installing it as a fallback
+      # costs nothing
+      - name: Set up QEMU (fallback)
+        if: steps.gate.outputs.run == 'yes'
+        uses: docker/setup-qemu-action@v3
+
+      # ---- extract rootfs → tar.gz → static validation ----
+      - name: Extract and validate rootfs
+        id: rootfs
+        if: steps.gate.outputs.run == 'yes'
+        run: |
+          set -eu
+          ./scripts/build-rootfs-tar.sh "${{ steps.gate.outputs.url }}" "out/${{ matrix.arch }}.tar.gz"
+          ./scripts/validate-rootfs.sh "out/${{ matrix.arch }}.tar.gz" "${{ matrix.want_elf }}"
+          sha256sum "out/${{ matrix.arch }}.tar.gz" > "rootfs-${{ matrix.arch }}.sha256"
+
+      # ---- build and push the image ----
+      - name: Build and push image
+        id: build
+        if: steps.gate.outputs.run == 'yes'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          build-args: ROOTFS_TAR=out/${{ matrix.arch }}.tar.gz
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.discover.outputs.version }}-${{ matrix.arch }}
+            ${{ env.IMAGE }}:latest-${{ matrix.arch }}
+          push: true
+
+      # ---- runtime smoke (x86_64 only; arm is covered by static validation) ----
+      - name: Smoke test (x86_64)
+        if: steps.gate.outputs.run == 'yes' && matrix.arch == 'x86_64'
+        run: |
+          set -eu
+          docker pull "${{ env.IMAGE }}:${{ needs.discover.outputs.version }}-x86_64"
+          ./scripts/smoke-test.sh "${{ env.IMAGE }}:${{ needs.discover.outputs.version }}-x86_64"
+
+      # ---- compute digest → publish GitHub release ----
+      - name: Compute image digest
+        id: meta
+        if: steps.gate.outputs.run == 'yes' && steps.build.conclusion == 'success'
+        run: |
+          set -eu
+          TAG="${{ needs.discover.outputs.version }}-${{ matrix.arch }}"
+          # The pushed object may be a single-platform manifest or a multi-arch
+          # OCI index — read whichever is there
+          DIGEST="$(docker buildx imagetools inspect "${{ env.IMAGE }}:$TAG" \
+            --format '{{if .Manifest}}{{.Manifest.Digest}}{{else}}{{.Index.Digest}}{{end}}')"
+          [ -n "$DIGEST" ]
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        if: steps.gate.outputs.run == 'yes' && !cancelled() && steps.build.conclusion == 'success' && steps.meta.conclusion == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          VERSION="${{ needs.discover.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          TAG="${VERSION}-${ARCH}"
+          # platform is e.g. linux/arm/v7 — use `|` as the delimiter here or the
+          # slashes in the platform would terminate the s/// command ("unknown
+          # option to `s'"). The other placeholders never contain a `/`.
+          sed -e "s/@VERSION@/${VERSION}/g" \
+              -e "s/@ARCH@/${ARCH}/g" \
+              -e "s|@PLATFORM@|${{ matrix.platform }}|g" \
+              -e "s/@DIGEST@/${{ steps.meta.outputs.digest }}/g" \
+              .github/release-notes.md > /tmp/release-notes.md
+          # Idempotent: delete the tag then re-create (re-running the same version
+          # doesn't error); if create fails anyway (a leftover manual/stale release
+          # on the same tag) force-delete and retry
+          delete_tag() {
+              gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag >/dev/null 2>&1 || true
+          }
+          delete_tag
+          if ! gh release create "$TAG" --repo "${{ github.repository }}" \
+              --title "$VERSION ($ARCH)" \
+              --target "$GITHUB_SHA" \
+              --notes-file /tmp/release-notes.md \
+              "rootfs-$ARCH.sha256"; then
+              echo "  release create failed; forcing delete + retry"
+              delete_tag
+              gh release create "$TAG" --repo "${{ github.repository }}" \
+                  --title "$VERSION ($ARCH)" \
+                  --target "$GITHUB_SHA" \
+                  --notes-file /tmp/release-notes.md \
+                  "rootfs-$ARCH.sha256"
+          fi
+
+      # ---- summarize into the workflow summary ----
+      - name: Workflow summary note
+        if: always()
+        run: |
+          {
+            echo "## \`${{ matrix.arch }}\` · ${{ needs.discover.outputs.version }}"
+            if [ "${{ steps.gate.conclusion }}" = "failure" ]; then
+              echo "❌ gate step failed (not a skip)"
+            elif ${{ contains(steps.gate.outputs.why, 'gh query failed') || contains(steps.gate.outputs.why, 'network issue') }}; then
+              echo "⚠️ skipped (probe/network/token issue, not a missing source — next cron retries)"
+              echo "- why: \`${{ steps.gate.outputs.why }}\`"
+            elif [ "${{ steps.gate.outputs.run }}" = "yes" ]; then
+              echo "✅ built and published"
+              echo "- why: \`${{ steps.gate.outputs.why }}\`"
+              echo "- rootfs: ${{ steps.gate.outputs.url }}"
+              echo "- image: \`${{ env.IMAGE }}:${{ needs.discover.outputs.version }}-${{ matrix.arch }}\`"
+              if [ "${{ matrix.arch }}" = "x86_64" ]; then
+                echo "- smoke: ✅ (firstuse_setup + supernode + babeld + table 21 blackhole)"
+              else
+                echo "- validation: static (validate-rootfs.sh: init/babeld/firstuse_setup present + ELF type)"
+              fi
+            else
+              echo "⏭ skipped"
+              echo "- why: \`${{ steps.gate.outputs.why }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
+  # 2. When all three architectures exist, merge into a suffix-less
+  # multi-arch manifest (never blocks any pipeline)
+  # ------------------------------------------------------------------
+  manifest:
+    name: Merge multi-arch manifest
+    needs: [discover, docker]
+    if: needs.discover.result == 'success' && needs.docker.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge manifest
+        run: |
+          set -eu
+          IMAGE="${{ env.IMAGE }}"
+          VERSION="${{ needs.discover.outputs.version }}"
+
+          # All three arches must really exist in the registry (a job that was
+          # skipped still counts as already-present)
+          missing=""
+          for a in x86_64 arm64 armv7l; do
+            if ! docker buildx imagetools inspect "${IMAGE}:${VERSION}-${a}" >/dev/null 2>&1; then
+              missing="$missing $a"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::notice::manifest merge skipped; not all arches present:$missing"
+            exit 0
+          fi
+
+          docker buildx imagetools create -t "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-x86_64" \
+            "${IMAGE}:${VERSION}-arm64" \
+            "${IMAGE}:${VERSION}-armv7l"
+          docker buildx imagetools create -t "${IMAGE}:latest" \
+            "${IMAGE}:latest-x86_64" \
+            "${IMAGE}:latest-arm64" \
+            "${IMAGE}:latest-armv7l"
+          echo "::notice::merged multi-arch manifest ${VERSION} and latest"

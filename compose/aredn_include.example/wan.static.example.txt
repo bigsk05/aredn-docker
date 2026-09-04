@@ -1,0 +1,15 @@
+# VARIANT: durable address on eth0 (fill in your docker-subnet IP, then use as
+# `wan.network.user`). Pick this when you need the node's service(s) reachable
+# through docker's published ports / docker-proxy / host DNAT.
+#
+# Why: netifd FLUSHES a docker-assigned address from any interface its config
+# mentions with no static address of its own (verified: proto 'none' on eth0 ->
+# address disappears mid-boot). With `proto static`, netifd OWNS the address and
+# re-adds it on every boot, so the port-forwarding target stays alive across
+# firmware reboots. IP below must equal the container's IP on the compose/bridge
+# subnet (e.g. the network's ipv4_address).
+config interface 'wan'
+	option device 'eth0'
+	option proto 'static'
+	option ipaddr '10.62.0.79'
+	option netmask '255.255.255.0'

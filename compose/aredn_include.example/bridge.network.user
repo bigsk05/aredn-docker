@@ -1,0 +1,4 @@
+config device
+	option name 'br0'
+	option type 'bridge'
+	option bridge_empty '1'

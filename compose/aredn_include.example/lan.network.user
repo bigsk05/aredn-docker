@@ -1,0 +1,3 @@
+config interface 'lan'
+	option device 'br0'
+	option proto 'none'

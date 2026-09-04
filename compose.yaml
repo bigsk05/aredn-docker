@@ -1,0 +1,62 @@
+# AREDN supernode container — deployment example
+#
+# Usage: pull/build the image, then:
+#   docker compose up -d
+#   docker exec <container> /usr/local/bin/firstuse_setup <node-name> <password>
+#
+# Notes (see README.md for detail):
+#   - No privileged mode. Only NET_ADMIN (create wg interfaces/rules) + SYS_NICE
+#     (babeld_wrapper runs `nice --20 babeld`; without it the container crash-loops)
+#     are needed. CAP_NET_RAW is already in Docker's default set.
+#   - sysctls are pre-set on the host side; the container's /proc/sys stays read-only.
+#   - babel hook /etc/aredn_include/babel-user.conf (`skip-kernel-setup true`) is
+#     baked into the image at build (the firmware's own include file, appended by
+#     babeld_wrapper), so babeld skips writing /proc/sys for wg interfaces created
+#     at runtime (those cannot be pre-set via --sysctl). No host-side file needed.
+#   - "Firmware reboot" == container exit; restart: unless-stopped brings it back.
+#   - Ports: tunnel service UDP 6525–6653 (supernode) / 5525–5653 (regular node);
+#     WebUI HTTP on TCP 80/8080.
+#
+# Networking: pick one of three shapes. Full recipes in README.md (§Network
+# shapes) and compose/aredn_include.example/README.md.
+#   1) Default bridge (this file): container gets a private IP on the compose
+#      network — fine for a local test run and for hand-wired DtD links via veth.
+#   2) macvlan (real deployment; the container is an independent LAN device, and
+#      the docker host itself cannot ping it):
+#      networks:
+#        wan:
+#          driver: macvlan
+#          driver_opts: { parent: <host-lan-iface> }
+#          ipam: { config: [{ subnet: <your-lan-subnet>, gateway: <gw> }] }
+#      and in the service set network to `wan`; DtD goes over a second macvlan.
+#   3) headless + static eth0 (recommended for a public supernode): mount the
+#      IP-free override set from compose/aredn_include.example/ over
+#      /etc/aredn_include (removes the LAN, keeps eth0 a plain interface), and
+#      give eth0 a static address on the compose subnet so published ports /
+#      host DNAT keep a stable target across firmware reboots. See the example
+#      dir for the files and the wan.static template.
+
+services:
+  aredn:
+    image: ghcr.io/bigsk05/aredn-docker:latest
+    container_name: aredn-supernode
+
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+
+    # Values babeld's kernel_setup() targets (if already correct, babeld skips writing)
+    sysctls:
+      net.ipv4.conf.all.forwarding: "1"
+      net.ipv6.conf.all.forwarding: "1"
+      net.ipv6.conf.all.accept_redirects: "0"
+      net.ipv4.conf.all.rp_filter: "0"
+
+    # No host-side files needed: the image bakes the babel hook into the
+    # firmware's own include file (/etc/aredn_include/babel-user.conf =
+    # `skip-kernel-setup true`). Mount your own conf over it only if you need
+    # additional per-line babeld options:
+    #   volumes:
+    #     - ./compose/babel-user.conf:/etc/aredn_include/babel-user.conf:ro
+
+    restart: unless-stopped

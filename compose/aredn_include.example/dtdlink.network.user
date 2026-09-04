@@ -1,0 +1,3 @@
+config interface 'dtdlink'
+	option device 'eth0'
+	option proto 'none'

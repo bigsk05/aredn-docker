@@ -1,0 +1,10 @@
+# CI build artifacts — not tracked in the repo
+rootfs-*.tar.gz
+rootfs-*.img
+*.sha256
+tmp/
+logs/
+out/
+
+# Idea
+.idea
