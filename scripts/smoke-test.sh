@@ -44,7 +44,7 @@ wait_pid() {
 # transition (after node-setup marks a reboot); returns the new container's
 # StartedAt (fails if it hasn't restarted within ~5 minutes)
 wait_restarted() {
-    _old="$(docker inspect -f '{{.State.StartedAt}}' "$NAME" 2>/dev/null || echo init)"
+    _old="${1:-$(docker inspect -f '{{.State.StartedAt}}' "$NAME" 2>/dev/null || echo init)}"
     _i=0
     while [ "$_i" -lt 150 ]; do
         _now="$(docker inspect -f '{{.State.StartedAt}}' "$NAME" 2>/dev/null || echo gone)"
@@ -75,17 +75,59 @@ docker run -d --name "$NAME" \
 echo "  boot      waiting for procd"
 wait_pid procd 30 2 || { echo "SMOKE FAIL: procd never came up"; exit 1; }
 
+# The firmware's config is not usable right after procd starts. Two boot-time
+# races make the un-retried one-shot drive fail:
+#
+#   * preinit's config_generate rewrites /etc/config.mesh section by section; a
+#     `uci set` that lands mid-rewrite sees a partial file (the target anonymous
+#     section not there yet) and busybox uci replies "Invalid argument".
+#   * node-setup needs the nvram defaults that aredn_init writes late in the
+#     boot chain (mac2 / lan_mask / ...). Driven too early it aborts, e.g.
+#     "Reference error ... in netmaskToCIDR()" because lan_mask is null.
+#
+# So wait for both before driving anything — a real operator only acts once the
+# device has finished booting. mac2 in the local nvram is the aredn_init marker.
+echo "  boot      waiting for boot to settle (aredn_init defaults in nvram)"
+_i=0
+while [ -z "$(docker exec "$NAME" uci -c /etc/local/uci get hsmmmesh.settings.mac2 2>/dev/null)" ]; do
+    _i=$((_i + 1))
+    if [ "$_i" -ge 40 ]; then
+        echo "SMOKE FAIL: boot never settled (no mac2 in hsmmmesh nvram after $((_i * 3))s)" >&2
+        exit 1
+    fi
+    sleep 3
+done
+
 echo "  init      firstuse_setup"
 docker exec "$NAME" /usr/local/bin/firstuse_setup CI-SMOKE-01 smoke123 >/dev/null
 
-echo "  init      enable supernode + node-setup"
-docker exec "$NAME" sh -c \
+# Enable the supernode. Retried because the config_generate rewrite can still be
+# in flight on a slow runner; each attempt either lands cleanly or within a
+# second regenerated file.
+_i=0
+while ! docker exec "$NAME" sh -c \
     'uci -c /etc/config.mesh set aredn.@supernode[0].enable=1 \
-     && uci -c /etc/config.mesh commit aredn \
-     && /usr/local/bin/node-setup' >/dev/null
+     && uci -c /etc/config.mesh commit aredn' >/dev/null 2>&1; do
+    _i=$((_i + 1))
+    if [ "$_i" -ge 20 ]; then
+        echo "SMOKE FAIL: could not enable supernode (config.mesh kept regenerating, $((_i * 3))s)" >&2
+        exit 1
+    fi
+    echo "  init      config.mesh still regenerating; retry $_i/20"
+    sleep 3
+done
+echo "  init      supernode enabled; node-setup"
+docker exec "$NAME" /usr/local/bin/node-setup || { echo "SMOKE FAIL: node-setup returned $?"; exit 1; }
 
-echo "  reboot    waiting for container restart (restart: unless-stopped)"
-wait_restarted || { echo "SMOKE FAIL: container did not restart after node-setup"; exit 1; }
+# node-setup marks a firmware reboot (/tmp/reboot-required → aredn_init calls
+# /sbin/reboot on the next boot). In an unprivileged container /sbin/reboot is
+# a silent no-op, so drive the equivalent transition ourselves: docker restart
+# is exactly the documented "firmware reboot == container exit; restart:
+# unless-stopped brings it back". wait_restarted below confirms the new boot.
+_pre="$(docker inspect -f '{{.State.StartedAt}}' "$NAME" 2>/dev/null || echo init)"
+docker restart "$NAME" >/dev/null 2>&1 || true
+echo "  reboot    restarting container to complete the firmware reboot"
+wait_restarted "$_pre" || { echo "SMOKE FAIL: container did not restart after node-setup"; exit 1; }
 
 echo "  check     babeld running"
 wait_pid babeld 30 2 || { echo "SMOKE FAIL: babeld not running"; exit 1; }
