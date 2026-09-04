@@ -1,0 +1,49 @@
+# AREDN supernode container — deployment example
+#
+# Usage: pull/build the image, then:
+#   docker compose up -d
+#   docker exec <container> /usr/local/bin/firstuse_setup <node-name> <password>
+#
+# Notes (see README.md and the workspace DEPLOYMENT-GUIDE for detail):
+#   - No privileged mode. Only NET_ADMIN (create wg interfaces/rules) + SYS_NICE
+#     (babeld_wrapper runs `nice --20 babeld`; without it the container crash-loops)
+#     are needed. CAP_NET_RAW is already in Docker's default set.
+#   - sysctls are pre-set on the host side; the container's /proc/sys stays read-only.
+#   - babel-user.conf sets `skip-kernel-setup true`, so babeld skips writing /proc/sys
+#     for wg interfaces created at runtime (those cannot be pre-set via --sysctl).
+#     This is an officially supported append hook — zero firmware modification.
+#   - "Firmware reboot" == container exit; restart: unless-stopped brings it back.
+#   - Ports: supernode tunnels UDP 6525–6653; normal nodes 5525–5653; WebUI 80/8080.
+#
+# Networking: pick one of two shapes.
+#   1) Default bridge (this file): container gets a 172.x private IP — fine for a local
+#      test run and for hand-wired DtD links via veth.
+#   2) macvlan (real deployment; the container is an independent LAN device, and the
+#      docker host itself cannot ping it):
+#      networks:
+#        wan:
+#          driver: macvlan
+#          driver_opts: { parent: eno1 }
+#          ipam: { config: [{ subnet: 10.165.25.0/24, gateway: 10.165.25.1 }] }
+#      and in the service set network to `wan`; DtD goes over a second macvlan.
+
+services:
+  aredn:
+    image: ghcr.io/bigsk05/aredn-docker:latest
+    container_name: aredn-supernode
+
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+
+    # Values babeld's kernel_setup() targets (if already correct, babeld skips writing)
+    sysctls:
+      net.ipv4.conf.all.forwarding: "1"
+      net.ipv6.conf.all.forwarding: "1"
+      net.ipv6.conf.all.accept_redirects: "0"
+      net.ipv4.conf.all.rp_filter: "0"
+
+    volumes:
+      - ./compose/babel-user.conf:/etc/aredn_include/babel-user.conf:ro
+
+    restart: unless-stopped
