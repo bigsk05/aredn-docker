@@ -4,8 +4,11 @@ Strip the **Supernode / TunnelServer** mode out of the AREDN firmware and run it
 **unprivileged user-space container**. The image is the official/community AREDN
 rootfs moved **unchanged** into a `scratch` base image — **zero firmware
 modification**; every container-environment adaptation (capabilities / sysctl /
-babel hook / network shapes / restart semantics) is done in the compose and
-orchestration layer.
+network shapes / restart semantics) is applied in the compose and orchestration
+layer. The one firmware-side hook a supernode needs is baked into the firmware's
+own include file at build time (`/etc/aredn_include/babel-user.conf` →
+`skip-kernel-setup true`; see "Babel hook") — so a deployment is a single
+compose file and needs **no host-side files**.
 
 - Image: `ghcr.io/bigsk05/aredn-docker`
 - Mechanism details: see `docker-test/DEPLOYMENT-GUIDE.md` in this project's
@@ -94,12 +97,23 @@ sysctls:
   net.ipv4.conf.all.rp_filter: "0"
 ```
 
-### Babel hook (zero firmware modification)
+### Babel hook (baked into the image, no host file)
 
-`compose/babel-user.conf` (`skip-kernel-setup true`) mounts to
-`/etc/aredn_include/babel-user.conf`. babeld_wrapper officially supports
-appending this file; it makes babeld skip writing `/proc/sys` for wg interfaces
-created at runtime (those can't be pre-set via `--sysctl`).
+AREDN already ships an empty include file at `/etc/aredn_include/babel-user.conf`
+(comment-only; `babeld_wrapper` officially appends it). The Dockerfile `COPY`s
+`compose/babel-user.conf` over it at build time, so the image contains
+`skip-kernel-setup true` — making babeld skip writing `/proc/sys` for wg
+interfaces created at runtime (those can't be pre-set via `--sysctl`, and the
+container's `/proc/sys` is read-only). This is the firmware's official extension
+mechanism, applied as a build-time container adaptation.
+
+Deploying therefore needs no host-side volume at all. To add extra per-line
+babel options for a specific deployment, mount your own file over it (`:ro`):
+
+```yaml
+volumes:
+  - ./compose/babel-user.conf:/etc/aredn_include/babel-user.conf:ro
+```
 
 ### Network shapes
 
@@ -131,7 +145,7 @@ created at runtime (those can't be pre-set via `--sysctl`).
 ```
 .github/workflows/build.yml   main assembly pipeline (detect/gate/build/smoke/publish)
 .github/release-notes.md      release template
-Dockerfile                    scratch + ADD rootfs (no RUN)
+Dockerfile                    scratch + ADD rootfs + baked babel hook (no RUN)
 compose.yaml                  production deployment example (caps/sysctl/babel hook/restart)
 compose/babel-user.conf       skip-kernel-setup hook
 scripts/latest-official-version.sh   detect the latest official version

@@ -10,5 +10,17 @@
 FROM scratch
 ARG ROOTFS_TAR=rootfs-x86_64.tar.gz
 ADD ${ROOTFS_TAR} /
+
+# Bake the babel hook into the firmware's own extension file so a supernode
+# deploy is a single compose file with NO host-side file. The rootfs already
+# ships /etc/aredn_include/babel-user.conf as an empty (comment-only) include
+# that babeld_wrapper officially appends; adding `skip-kernel-setup true` here
+# makes babeld skip writing /proc/sys for wg interfaces created at runtime
+# (the container's /proc/sys is read-only). This is the same 12 bytes the
+# compose layer used to inject via a bind mount — now a static layer, still
+# no RUN/QEMU, identical content for all three architectures. Mounting your
+# own babel-user.conf over it still overrides, for extra per-line options.
+COPY compose/babel-user.conf /etc/aredn_include/babel-user.conf
+
 ENV PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ENTRYPOINT ["/sbin/init"]
