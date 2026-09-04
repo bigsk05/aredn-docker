@@ -224,9 +224,12 @@ jobs:
           VERSION="${{ needs.discover.outputs.version }}"
           ARCH="${{ matrix.arch }}"
           TAG="${VERSION}-${ARCH}"
+          # platform is e.g. linux/arm/v7 — use `|` as the delimiter here or the
+          # slashes in the platform would terminate the s/// command ("unknown
+          # option to `s'"). The other placeholders never contain a `/`.
           sed -e "s/@VERSION@/${VERSION}/g" \
               -e "s/@ARCH@/${ARCH}/g" \
-              -e "s/@PLATFORM@/${{ matrix.platform }}/g" \
+              -e "s|@PLATFORM@|${{ matrix.platform }}|g" \
               -e "s/@DIGEST@/${{ steps.meta.outputs.digest }}/g" \
               .github/release-notes.md > /tmp/release-notes.md
           # Idempotent: delete the tag then re-create (re-running the same version
