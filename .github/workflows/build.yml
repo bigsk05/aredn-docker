@@ -33,7 +33,14 @@ on:
         description: 'true = ignore the "already published" check and rebuild'
         required: false
         default: 'false'
-        type: boolean
+        # choice (not boolean): a dropdown always lands one of two explicit strings,
+        # so a "checked but ignored" dispatch is impossible to misread (boolean
+        # checkbox propagation has bitten this repo: a fresh dispatch with force
+        # checked still reached the gate as false).
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -115,8 +122,16 @@ jobs:
           ARCH="${{ matrix.arch }}"
           IMAGE="${{ env.IMAGE }}"
 
+          # Diagnose input propagation: print the RAW dispatch inputs so a "why
+          # did it skip" is self-evident instead of a silent gate skip. Schedule
+          # runs have empty inputs (''); a manual dispatch must show force=true
+          # here for the rebuild to happen.
+          echo "  gate inputs: event=${{ github.event_name }} arch=${{ inputs.arch }} force=${{ inputs.force }}"
+          echo "::notice::gate inputs: event=${{ github.event_name }} arch=${{ inputs.arch }} force=${{ inputs.force }}"
+
           ARCH_FILTER="${{ github.event_name == 'workflow_dispatch' && inputs.arch != 'all' && matrix.arch != inputs.arch }}"
           FORCE="${{ inputs.force == 'true' }}"
+          echo "  gate eval: ARCH_FILTER=$ARCH_FILTER FORCE=$FORCE"
 
           # 1) Manual dispatch pinned an arch — skip the unrelated ones
           if [ "$ARCH_FILTER" = "true" ]; then
@@ -141,7 +156,7 @@ jobs:
           if [ "$FORCE" != "true" ] &&
              docker buildx imagetools inspect "${IMAGE}:${VERSION}-${ARCH}" >/dev/null 2>&1; then
             echo "run=no" >> "$GITHUB_OUTPUT"
-            echo "why=${VERSION}-${ARCH} already built"
+            echo "why=${VERSION}-${ARCH} already built (force='${{ inputs.force }}')"
             exit 0
           fi
 
