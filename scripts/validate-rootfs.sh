@@ -41,9 +41,12 @@ fi
 # "ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV)";
 # the machine type is the 2nd comma-separated field. On non-ELF output we fall
 # back to the whole string (grep then fails to match → gate blocks).
+#
+# -L is required: /sbin/init is a symlink to ../sbin/procd, and file(1) without
+# -L reports "symbolic link to ..." — no ELF header → the check never matches.
 for probe in sbin/init usr/sbin/babeld; do
     [ -f "$TMP/$probe" ] || continue
-    out="$(file -b "$TMP/$probe")"
+    out="$(file -bL "$TMP/$probe")"
     machine="$(printf '%s' "$out" | awk -F, 'NR==1 && $1 ~ /ELF/ { gsub(/^ +| +$/, "", $2); print $2 }')"
     [ -n "$machine" ] || machine="$out"
     echo "  elf       $probe -> $machine"
